@@ -12,12 +12,11 @@ import {
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Ionicons } from '@expo/vector-icons';
 import { LinearGradient } from 'expo-linear-gradient';
-import { useFocusEffect } from '@react-navigation/native'; // Add this import
+import { useFocusEffect } from '@react-navigation/native';
 import AddExpenseModal from '../../components/AddExpenseModal';
 import ExpenseCard from '../../components/ExpenseCard';
 import WalletTopUpModal from '../../components/WalletTopUpModal';
 import SavingsModal from '../../components/SavingModal';
-
 
 const { width } = Dimensions.get('window');
 
@@ -236,6 +235,35 @@ export default function TodayScreen() {
     }
   };
 
+  // Reset Budget Function
+  const handleResetBudget = async () => {
+    Alert.alert(
+      'Reset Budget',
+      'Are you sure? This will set your wallet balance to ₹0 and reset all budget calculations.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Reset',
+          style: 'destructive',
+          onPress: async () => {
+            try {
+              // Reset wallet balance to 0
+              await AsyncStorage.setItem('walletBalance', '0');
+              
+              // Reload all data
+              await loadData();
+              
+              Alert.alert('Success', 'Budget has been reset to ₹0');
+            } catch (err) {
+              console.error('Error resetting budget:', err);
+              Alert.alert('Error', 'Failed to reset budget');
+            }
+          },
+        },
+      ]
+    );
+  };
+
   const rawProgress  = todayQuota > 0 ? (todaySpent / todayQuota) * 100 : 0;
   const progress     = Math.min(rawProgress, 100);
   const isOverBudget = todaySpent > todayQuota && todayQuota > 0;
@@ -257,8 +285,16 @@ export default function TodayScreen() {
             <Text style={styles.greeting}>Hello, Asad!</Text>
             <Text style={styles.headerSub}>Track your daily spending</Text>
           </View>
-          <View style={styles.avatarPlaceholder}>
-            <Ionicons name="person-outline" size={16} color={COLORS.mint} />
+          <View style={styles.headerActions}>
+            {/* Reset Button */}
+            <TouchableOpacity 
+              style={styles.resetButton} 
+              onPress={handleResetBudget}
+              activeOpacity={0.8}
+            >
+              <Ionicons name="refresh-outline" size={18} color={COLORS.crimson} />
+            </TouchableOpacity>
+            
           </View>
         </View>
 
@@ -476,6 +512,11 @@ const styles = StyleSheet.create({
     paddingHorizontal: 16,
     paddingBottom: 16,
   },
+  headerActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+  },
   greeting: {
     fontSize: 20,
     fontWeight: '700',
@@ -485,6 +526,16 @@ const styles = StyleSheet.create({
     fontSize: 12,
     color: COLORS.textMuted,
     marginTop: 2,
+  },
+  resetButton: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    backgroundColor: COLORS.crimsonDim,
+    borderWidth: 1,
+    borderColor: COLORS.crimson + '40',
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   avatarPlaceholder: {
     width: 36,

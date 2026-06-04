@@ -13,6 +13,8 @@ import { Ionicons } from '@expo/vector-icons';
 import { LinearGradient } from 'expo-linear-gradient';
 import { useFocusEffect } from '@react-navigation/native';
 import ExpenseCard from '../../components/ExpenseCard';
+import BudgetManager from '../../components/BudgetManager';
+import BudgetProgressCard from '../../components/BudgetProgressCard';
 
 // ─── Design Tokens (in sync with TodayScreen) ─────────────────────────────────
 const COLORS = {
@@ -68,6 +70,10 @@ export default function HistoryScreen() {
   const [allExpenses,      setAllExpenses]      = useState([]);
   const [filteredExpenses, setFilteredExpenses] = useState([]);
   const [selectedTag,      setSelectedTag]      = useState('All');
+  const [budgetModalVisible, setBudgetModalVisible] = useState(false);
+  const [categoryBudgets, setCategoryBudgets] = useState({});
+  const [categorySpending, setCategorySpending] = useState({});
+  const [showBudgets, setShowBudgets] = useState(false); // New state for toggling budgets
 
   const loadExpenses = useCallback(async () => {
     try {
@@ -90,12 +96,65 @@ export default function HistoryScreen() {
     }
   }, [selectedTag]);
 
+  // Load category spending
+  const loadCategorySpending = useCallback(async () => {
+    try {
+      const raw = await AsyncStorage.getItem('expenses');
+      if (raw) {
+        const expenses = JSON.parse(raw);
+        const currentMonth = new Date().getMonth();
+        const currentYear = new Date().getFullYear();
+        
+        const spending = {};
+        expenses.forEach(expense => {
+          const expenseDate = new Date(expense.timestamp);
+          if (expenseDate.getMonth() === currentMonth && expenseDate.getFullYear() === currentYear) {
+            spending[expense.tag] = (spending[expense.tag] || 0) + expense.amount;
+          }
+        });
+        setCategorySpending(spending);
+      }
+    } catch (error) {
+      console.error('Error loading category spending:', error);
+    }
+  }, []);
+
+  // Load budgets
+  const loadBudgets = useCallback(async () => {
+    try {
+      const savedBudgets = await AsyncStorage.getItem('categoryBudgets');
+      if (savedBudgets) {
+        setCategoryBudgets(JSON.parse(savedBudgets));
+      } else {
+        const defaultBudgets = {
+          Food: 5000,
+          Transport: 3000,
+          Shopping: 4000,
+          Entertainment: 3000,
+          Bills: 10000,
+          Other: 2000,
+        };
+        setCategoryBudgets(defaultBudgets);
+        await AsyncStorage.setItem('categoryBudgets', JSON.stringify(defaultBudgets));
+      }
+    } catch (error) {
+      console.error('Error loading budgets:', error);
+    }
+  }, []);
+
   // Refresh data when screen comes into focus
   useFocusEffect(
     useCallback(() => {
       loadExpenses();
-    }, [loadExpenses])
+      loadCategorySpending();
+    }, [loadExpenses, loadCategorySpending])
   );
+
+  // Initial load for budgets and spending
+  useEffect(() => {
+    loadBudgets();
+    loadCategorySpending();
+  }, []);
 
   const applyFilter = (tag, list) => {
     setSelectedTag(tag);
@@ -116,13 +175,17 @@ export default function HistoryScreen() {
       await AsyncStorage.setItem('walletBalance', newBalance.toString());
 
       await loadExpenses();
+      await loadCategorySpending();
     } catch (err) {
       console.error('Error deleting expense:', err);
       Alert.alert('Error', 'Failed to delete expense.');
     }
   };
 
-  const handleUpdateExpense = useCallback(() => loadExpenses(), [loadExpenses]);
+  const handleUpdateExpense = useCallback(() => {
+    loadExpenses();
+    loadCategorySpending();
+  }, [loadExpenses, loadCategorySpending]);
 
   // Category breakdown from ALL expenses (not filtered)
   const tagStats = allExpenses.reduce((acc, e) => {
@@ -139,6 +202,15 @@ export default function HistoryScreen() {
     return acc;
   }, {});
   const dates = Object.keys(grouped).sort((a, b) => new Date(b) - new Date(a));
+
+  // Calculate total budget status (how many categories are over/under)
+  const budgetStats = Object.entries(categoryBudgets).reduce((stats, [category, budget]) => {
+    const spent = categorySpending[category] || 0;
+    if (spent > budget) stats.over++;
+    else if (spent > budget * 0.8) stats.warning++;
+    else stats.onTrack++;
+    return stats;
+  }, { over: 0, warning: 0, onTrack: 0 });
 
   return (
     <View style={styles.root}>
@@ -157,6 +229,72 @@ export default function HistoryScreen() {
           </View>
         </View>
 
+        {/* ── Budget Summary Banner (Collapsible) ── */}
+        <TouchableOpacity 
+          style={styles.budgetSummary}
+          onPress={() => setShowBudgets(!showBudgets)}
+          activeOpacity={0.8}
+        >
+          <LinearGradient
+            colors={[COLORS.card, COLORS.surface]}
+            style={styles.summaryGradient}
+            start={{ x: 0, y: 0 }}
+            end={{ x: 1, y: 1 }}
+          >
+            <View style={styles.summaryLeft}>
+              <View style={styles.summaryIcon}>
+                <Ionicons name="pie-chart-outline" size={16} color={COLORS.mint} />
+              </View>
+              <View>
+                <Text style={styles.summaryTitle}>Monthly Budgets</Text>
+                <Text style={styles.summarySub}>
+                  {budgetStats.over > 0 && `${budgetStats.over} over · `}
+                  {budgetStats.warning > 0 && `${budgetStats.warning} near limit · `}
+                  {budgetStats.onTrack} on track
+                </Text>
+              </View>
+            </View>
+            <View style={styles.summaryRight}>
+              <TouchableOpacity 
+                style={styles.settingsButton}
+                onPress={(e) => {
+                  e.stopPropagation();
+                  setBudgetModalVisible(true);
+                }}
+              >
+                <Ionicons name="settings-outline" size={14} color={COLORS.mint} />
+              </TouchableOpacity>
+              <Ionicons 
+                name={showBudgets ? 'chevron-up' : 'chevron-down'} 
+                size={18} 
+                color={COLORS.textMuted} 
+              />
+            </View>
+          </LinearGradient>
+        </TouchableOpacity>
+
+        {/* ── Budget Progress Cards (Collapsible Section) ── */}
+        {showBudgets && Object.keys(categoryBudgets).length > 0 && (
+          <View style={styles.budgetSection}>
+            {Object.entries(categoryBudgets).map(([category, budget]) => {
+              const spent = categorySpending[category] || 0;
+              const categoryInfo = TAGS.find(t => t.label === category);
+              if (!categoryInfo || category === 'All') return null;
+              
+              return (
+                <BudgetProgressCard
+                  key={category}
+                  category={category}
+                  spent={spent}
+                  budget={budget}
+                  icon={categoryInfo.icon}
+                  color={categoryInfo.color}
+                />
+              );
+            })}
+          </View>
+        )}
+
         {/* ── Category Breakdown ───────────────────────────────────── */}
         {Object.keys(tagStats).length > 0 && (
           <View style={styles.section}>
@@ -165,6 +303,7 @@ export default function HistoryScreen() {
               <View style={styles.breakdownRow}>
                 {Object.entries(tagStats)
                   .sort(([, a], [, b]) => b - a)
+                  .slice(0, 6)
                   .map(([tag, amount]) => {
                     const meta = TAG_MAP[tag] || TAG_MAP['Other'];
                     const pct  = allTotal > 0 ? (amount / allTotal) * 100 : 0;
@@ -278,6 +417,18 @@ export default function HistoryScreen() {
 
         <View style={{ height: 40 }} />
       </ScrollView>
+
+      {/* Budget Manager Modal */}
+      <BudgetManager
+        visible={budgetModalVisible}
+        onClose={() => {
+          setBudgetModalVisible(false);
+          loadBudgets();
+        }}
+        onBudgetUpdate={(newBudgets) => {
+          setCategoryBudgets(newBudgets);
+        }}
+      />
     </View>
   );
 }
@@ -321,6 +472,67 @@ const styles = StyleSheet.create({
     borderColor: COLORS.mint + '50',
     alignItems: 'center',
     justifyContent: 'center',
+  },
+
+  // Budget Summary Banner
+  budgetSummary: {
+    marginHorizontal: 16,
+    marginBottom: 16,
+    borderRadius: 12,
+    overflow: 'hidden',
+  },
+  summaryGradient: {
+    padding: 12,
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: COLORS.cardBorder,
+    borderRadius: 12,
+  },
+  summaryLeft: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+  },
+  summaryIcon: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    backgroundColor: COLORS.mintDim,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  summaryTitle: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: COLORS.text,
+  },
+  summarySub: {
+    fontSize: 10,
+    color: COLORS.textMuted,
+    marginTop: 2,
+  },
+  summaryRight: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+  },
+  settingsButton: {
+    width: 28,
+    height: 28,
+    borderRadius: 14,
+    backgroundColor: COLORS.card,
+    borderWidth: 1,
+    borderColor: COLORS.cardBorder,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+
+  // Budget Section (Collapsible)
+  budgetSection: {
+    paddingHorizontal: 16,
+    marginBottom: 16,
   },
 
   // Section

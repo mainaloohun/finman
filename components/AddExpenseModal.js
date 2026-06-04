@@ -1,8 +1,4 @@
-import React, { useState, useEffect } from 'react';
-
-
-// After adding an expense
-
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import {
   View,
   Text,
@@ -14,7 +10,10 @@ import {
   Keyboard,
   ScrollView,
   Alert,
+  Platform,
+  KeyboardAvoidingView,
 } from 'react-native';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Ionicons } from '@expo/vector-icons';
 import { LinearGradient } from 'expo-linear-gradient';
 
@@ -58,9 +57,20 @@ const AddExpenseModal = ({ visible, onClose, onSubmit, remainingBudget = 0, toda
   const [expenseName, setExpenseName] = useState('');
   const [selectedTag, setSelectedTag] = useState('Food');
   const [note, setNote]               = useState('');
+  const [categoryBudgetInfo, setCategoryBudgetInfo] = useState(null);
+  const [isLoading, setIsLoading]     = useState(false);
+  const amountInputRef = useRef(null);
+  const scrollViewRef = useRef(null);
+  const budgetCacheRef = useRef({});
 
   useEffect(() => {
-    if (!visible) resetForm();
+    if (!visible) {
+      resetForm();
+    } else {
+      setTimeout(() => {
+        amountInputRef.current?.focus();
+      }, 300);
+    }
   }, [visible]);
 
   const resetForm = () => {
@@ -68,9 +78,72 @@ const AddExpenseModal = ({ visible, onClose, onSubmit, remainingBudget = 0, toda
     setExpenseName('');
     setSelectedTag('Food');
     setNote('');
+    setCategoryBudgetInfo(null);
+    setIsLoading(false);
   };
 
-  const handleSubmit = async () => {
+  // Memoized budget check to prevent unnecessary re-renders
+  const checkCategoryBudget = useCallback(async (amountValue, category) => {
+    if (amountValue <= 0) return true;
+    
+    // Create cache key
+    const cacheKey = `${category}_${amountValue}`;
+    
+    // Check cache first
+    if (budgetCacheRef.current[cacheKey]) {
+      setCategoryBudgetInfo(budgetCacheRef.current[cacheKey]);
+      return budgetCacheRef.current[cacheKey].willExceed === false;
+    }
+    
+    try {
+      const savedBudgets = await AsyncStorage.getItem('categoryBudgets');
+      if (!savedBudgets) return true;
+
+      const budgets = JSON.parse(savedBudgets);
+      const categoryBudget = budgets[category];
+      if (!categoryBudget) return true;
+
+      const savedExpenses = await AsyncStorage.getItem('expenses');
+      let currentSpending = 0;
+      
+      if (savedExpenses) {
+        const allExpenses = JSON.parse(savedExpenses);
+        const currentMonth = new Date().getMonth();
+        const currentYear = new Date().getFullYear();
+        
+        currentSpending = allExpenses
+          .filter(expense => {
+            const expenseDate = new Date(expense.timestamp);
+            return expense.tag === category && 
+                   expenseDate.getMonth() === currentMonth && 
+                   expenseDate.getFullYear() === currentYear;
+          })
+          .reduce((sum, expense) => sum + expense.amount, 0);
+      }
+
+      const newTotal = currentSpending + amountValue;
+      const budgetInfo = {
+        budget: categoryBudget,
+        spent: currentSpending,
+        remaining: categoryBudget - currentSpending,
+        newTotal: newTotal,
+        willExceed: newTotal > categoryBudget
+      };
+      
+      // Store in cache
+      budgetCacheRef.current[cacheKey] = budgetInfo;
+      setCategoryBudgetInfo(budgetInfo);
+      
+      return !budgetInfo.willExceed;
+    } catch (error) {
+      console.error('Error checking category budget:', error);
+      return true;
+    }
+  }, []);
+
+  const handleSubmit = useCallback(async () => {
+    if (isLoading) return;
+    
     const expenseAmount = safeFloat(amount);
 
     if (expenseAmount <= 0) {
@@ -78,23 +151,122 @@ const AddExpenseModal = ({ visible, onClose, onSubmit, remainingBudget = 0, toda
       return;
     }
     
-    
+    setIsLoading(true);
+    const finalName = expenseName.trim() || selectedTag;
+    const isWithinBudget = await checkCategoryBudget(expenseAmount, selectedTag);
+
+    if (!isWithinBudget && categoryBudgetInfo) {
+      setIsLoading(false);
+      Alert.alert(
+        'Budget Warning',
+        `This will exceed your ${selectedTag} budget!\n\n` +
+        `Budget: ${formatAmount(categoryBudgetInfo.budget)}\n` +
+        `Current: ${formatAmount(categoryBudgetInfo.spent)}\n` +
+        `This expense: ${formatAmount(expenseAmount)}\n` +
+        `Over by: ${formatAmount(categoryBudgetInfo.newTotal - categoryBudgetInfo.budget)}`,
+        [
+          { text: 'Cancel', style: 'cancel' },
+          { 
+            text: 'Add Anyway', 
+            onPress: async () => {
+              const success = await onSubmit({
+                amount: expenseAmount,
+                name: finalName,
+                tag: selectedTag,
+                note: note.trim(),
+              });
+              if (success) onClose();
+              setIsLoading(false);
+            }
+          }
+        ]
+      );
+      return;
+    }
 
     const success = await onSubmit({
       amount: expenseAmount,
-      name:   expenseName.trim(),
-      tag:    selectedTag,
-      note:   note.trim(),
+      name: finalName,
+      tag: selectedTag,
+      note: note.trim(),
     });
 
+    setIsLoading(false);
     if (success) onClose();
-  };
+  }, [amount, expenseName, selectedTag, note, categoryBudgetInfo, isLoading]);
 
-  // Progress of current amount vs remaining budget
-  const typedAmount   = safeFloat(amount);
-  const budgetPct     = remainingBudget > 0 ? Math.min((typedAmount / remainingBudget) * 100, 100) : 0;
-  const isOverBudget  = typedAmount > remainingBudget && remainingBudget > 0;
-  const barColor      = isOverBudget ? COLORS.crimson : budgetPct > 75 ? COLORS.amber : COLORS.mint;
+  // Debounced budget check
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      const typedAmount = safeFloat(amount);
+      if (typedAmount > 0) {
+        checkCategoryBudget(typedAmount, selectedTag);
+      } else {
+        setCategoryBudgetInfo(null);
+      }
+    }, 300);
+    
+    return () => clearTimeout(timer);
+  }, [amount, selectedTag, checkCategoryBudget]);
+
+  // Handle tag change without causing flicker
+  const handleTagChange = useCallback((tag) => {
+    setSelectedTag(tag);
+    // Clear cache when tag changes to force fresh calculation
+    budgetCacheRef.current = {};
+    // Re-check budget with current amount
+    const typedAmount = safeFloat(amount);
+    if (typedAmount > 0) {
+      checkCategoryBudget(typedAmount, tag);
+    }
+  }, [amount, checkCategoryBudget]);
+
+  // Scroll to amount input when keyboard opens
+  const handleAmountFocus = useCallback(() => {
+    setTimeout(() => {
+      scrollViewRef.current?.scrollTo({ y: 120, animated: true });
+    }, 100);
+  }, []);
+
+  const typedAmount = safeFloat(amount);
+  const budgetPct = remainingBudget > 0 ? Math.min((typedAmount / remainingBudget) * 100, 100) : 0;
+  const isOverBudget = typedAmount > remainingBudget && remainingBudget > 0;
+  const barColor = isOverBudget ? COLORS.crimson : budgetPct > 75 ? COLORS.amber : COLORS.mint;
+
+  // Memoize tag buttons to prevent unnecessary re-renders
+  const tagButtons = useMemo(() => (
+    <ScrollView 
+      horizontal 
+      showsHorizontalScrollIndicator={false}
+      contentContainerStyle={styles.tagScrollContent}
+    >
+      {TAGS.map((tag) => {
+        const active = selectedTag === tag.label;
+        return (
+          <TouchableOpacity
+            key={tag.label}
+            style={[
+              styles.tagChip,
+              active
+                ? { backgroundColor: tag.color + '22', borderColor: tag.color + '80' }
+                : { backgroundColor: COLORS.surface, borderColor: COLORS.cardBorder },
+            ]}
+            onPress={() => handleTagChange(tag.label)}
+            activeOpacity={0.7}
+          >
+            <Ionicons
+              name={tag.icon}
+              size={14}
+              color={active ? tag.color : COLORS.textDim}
+            />
+            <Text style={[styles.tagLabel, { color: active ? tag.color : COLORS.textMuted }]}>
+              {tag.label}
+            </Text>
+          </TouchableOpacity>
+        );
+      })}
+    </ScrollView>
+  ), [selectedTag, handleTagChange]);
 
   return (
     <Modal
@@ -104,60 +276,75 @@ const AddExpenseModal = ({ visible, onClose, onSubmit, remainingBudget = 0, toda
       onRequestClose={onClose}
     >
       <TouchableWithoutFeedback onPress={Keyboard.dismiss}>
-        <View style={styles.overlay}>
+        <KeyboardAvoidingView 
+          style={styles.overlay}
+          behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+          keyboardVerticalOffset={Platform.OS === 'ios' ? 0 : 0}
+        >
           <View style={styles.sheet}>
-            {/* Handle bar */}
             <View style={styles.handle} />
 
-            {/* Header */}
             <View style={styles.header}>
               <View>
                 <Text style={styles.headerTitle}>New Expense</Text>
                 <Text style={styles.headerSub}>Log what you spent</Text>
               </View>
-              <TouchableOpacity onPress={onClose} style={styles.closeBtn} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
+              <TouchableOpacity onPress={onClose} style={styles.closeBtn}>
                 <Ionicons name="close" size={20} color={COLORS.textMuted} />
               </TouchableOpacity>
             </View>
 
-            <ScrollView showsVerticalScrollIndicator={false} keyboardShouldPersistTaps="handled">
-
-              {/* Budget Banner */}
+            <ScrollView 
+              ref={scrollViewRef}
+              showsVerticalScrollIndicator={false}
+              keyboardShouldPersistTaps="handled"
+              contentContainerStyle={styles.scrollContent}
+              automaticallyAdjustKeyboardInsets={true}
+              keyboardDismissMode="interactive"
+            >
+              {/* Budget Banner - Compact */}
               <View style={styles.budgetBanner}>
-                <View>
+                <View style={styles.budgetLeft}>
                   <Text style={styles.bannerLabel}>REMAINING TODAY</Text>
                   <Text style={[styles.bannerAmount, { color: isOverBudget ? COLORS.crimson : COLORS.mint }]}>
                     {formatAmount(remainingBudget)}
                   </Text>
                 </View>
-                <View style={styles.bannerRight}>
-                  <Text style={styles.bannerMeta}>Quota  <Text style={styles.bannerMetaVal}>{formatAmount(dailyQuota)}</Text></Text>
-                  <Text style={styles.bannerMeta}>Spent  <Text style={styles.bannerMetaVal}>{formatAmount(todaySpent)}</Text></Text>
+                <View style={styles.budgetDivider} />
+                <View style={styles.budgetRight}>
+                  <Text style={styles.bannerMeta}>Quota: {formatAmount(dailyQuota)}</Text>
+                  <Text style={styles.bannerMeta}>Spent: {formatAmount(todaySpent)}</Text>
                 </View>
               </View>
 
-              {/* Amount Input */}
+              {/* Tags - Memoized */}
               <View style={styles.section}>
-                <Text style={styles.label}>AMOUNT</Text>
+                <Text style={styles.label}>CATEGORY</Text>
+                {tagButtons}
+              </View>
+
+              {/* Amount Input - Auto-focused with scroll */}
+              <View style={[styles.section, styles.amountSection]}>
+                <Text style={styles.label}>AMOUNT *</Text>
                 <View style={[styles.amountRow, isOverBudget && { borderColor: COLORS.crimson + '60' }]}>
                   <Text style={[styles.rupee, { color: isOverBudget ? COLORS.crimson : COLORS.mint }]}>₹</Text>
                   <TextInput
+                    ref={amountInputRef}
                     style={[styles.amountInput, { color: isOverBudget ? COLORS.crimson : COLORS.text }]}
                     placeholder="0.00"
                     placeholderTextColor={COLORS.textDim}
                     keyboardType="numeric"
                     value={amount}
                     onChangeText={setAmount}
-                    autoFocus
+                    onFocus={handleAmountFocus}
                   />
                   {typedAmount > 0 && (
                     <TouchableOpacity onPress={() => setAmount('')} style={styles.clearBtn}>
-                      <Ionicons name="close-circle" size={18} color={COLORS.textDim} />
+                      <Ionicons name="close-circle" size={16} color={COLORS.textDim} />
                     </TouchableOpacity>
                   )}
                 </View>
 
-                {/* Mini progress bar */}
                 {typedAmount > 0 && (
                   <View style={styles.miniTrack}>
                     <View style={[styles.miniFill, { width: `${budgetPct}%`, backgroundColor: barColor }]} />
@@ -165,76 +352,54 @@ const AddExpenseModal = ({ visible, onClose, onSubmit, remainingBudget = 0, toda
                 )}
                 {isOverBudget && (
                   <Text style={styles.overText}>
-                    Exceeds remaining budget by {formatAmount(typedAmount - remainingBudget)}
+                    Over by {formatAmount(typedAmount - remainingBudget)}
                   </Text>
                 )}
               </View>
 
-              {/* Expense Name */}
+              {/* Category Budget Info - Compact */}
+              {categoryBudgetInfo && typedAmount > 0 && categoryBudgetInfo.willExceed && (
+                <View style={styles.budgetWarningChip}>
+                  <Ionicons name="alert-circle" size={14} color={COLORS.crimson} />
+                  <Text style={styles.budgetWarningText}>
+                    Will exceed budget by {formatAmount(categoryBudgetInfo.newTotal - categoryBudgetInfo.budget)}
+                  </Text>
+                </View>
+              )}
+
+              {/* Expense Name - Compact */}
               <View style={styles.section}>
-                <Text style={styles.label}>EXPENSE NAME</Text>
+                <Text style={styles.label}>EXPENSE NAME <Text style={styles.optional}>(OPTIONAL)</Text></Text>
                 <TextInput
                   style={styles.textInput}
-                  placeholder="e.g. Coffee, Auto, Groceries…"
+                  placeholder={selectedTag}
                   placeholderTextColor={COLORS.textDim}
                   value={expenseName}
                   onChangeText={setExpenseName}
                 />
               </View>
 
-              {/* Tags */}
-              <View style={styles.section}>
-                <Text style={styles.label}>CATEGORY</Text>
-                <ScrollView horizontal showsHorizontalScrollIndicator={false}>
-                  <View style={styles.tagRow}>
-                    {TAGS.map((tag) => {
-                      const active = selectedTag === tag.label;
-                      return (
-                        <TouchableOpacity
-                          key={tag.label}
-                          style={[
-                            styles.tagChip,
-                            active
-                              ? { backgroundColor: tag.color + '22', borderColor: tag.color + '80' }
-                              : { backgroundColor: COLORS.surface, borderColor: COLORS.cardBorder },
-                          ]}
-                          onPress={() => setSelectedTag(tag.label)}
-                        >
-                          <Ionicons
-                            name={tag.icon}
-                            size={14}
-                            color={active ? tag.color : COLORS.textDim}
-                          />
-                          <Text style={[styles.tagLabel, { color: active ? tag.color : COLORS.textMuted }]}>
-                            {tag.label}
-                          </Text>
-                        </TouchableOpacity>
-                      );
-                    })}
-                  </View>
-                </ScrollView>
-              </View>
-
-              {/* Note */}
+              {/* Note - Compact */}
               <View style={styles.section}>
                 <Text style={styles.label}>NOTE <Text style={styles.optional}>(OPTIONAL)</Text></Text>
                 <TextInput
                   style={[styles.textInput, styles.noteInput]}
-                  placeholder="Any extra detail…"
+                  placeholder="Add a note..."
                   placeholderTextColor={COLORS.textDim}
                   value={note}
                   onChangeText={setNote}
                   multiline
-                  numberOfLines={3}
+                  numberOfLines={2}
                   textAlignVertical="top"
                 />
               </View>
 
-              {/* Submit - Always green, always enabled */}
+              {/* Submit Button - Compact */}
               <TouchableOpacity
-                style={styles.submitBtn}
+                style={[styles.submitBtn, isLoading && styles.submitBtnDisabled]}
                 onPress={handleSubmit}
                 activeOpacity={0.85}
+                disabled={isLoading}
               >
                 <LinearGradient
                   colors={['#00E5A0', '#00B87C']}
@@ -242,15 +407,17 @@ const AddExpenseModal = ({ visible, onClose, onSubmit, remainingBudget = 0, toda
                   start={{ x: 0, y: 0 }}
                   end={{ x: 1, y: 1 }}
                 >
-                  <Ionicons name="add-circle-outline" size={20} color={COLORS.bg} />
-                  <Text style={styles.submitText}>Add Expense</Text>
+                  <Ionicons name="add" size={18} color={COLORS.bg} />
+                  <Text style={styles.submitText}>
+                    {isLoading ? 'Adding...' : 'Add Expense'}
+                  </Text>
                 </LinearGradient>
               </TouchableOpacity>
 
-              <View style={{ height: 30 }} />
+              <View style={{ height: Platform.OS === 'ios' ? 40 : 20 }} />
             </ScrollView>
           </View>
-        </View>
+        </KeyboardAvoidingView>
       </TouchableWithoutFeedback>
     </Modal>
   );
@@ -259,50 +426,50 @@ const AddExpenseModal = ({ visible, onClose, onSubmit, remainingBudget = 0, toda
 const styles = StyleSheet.create({
   overlay: {
     flex: 1,
-    backgroundColor: 'rgba(0,0,0,0.7)',
     justifyContent: 'flex-end',
   },
   sheet: {
     backgroundColor: COLORS.surface,
-    borderTopLeftRadius: 28,
-    borderTopRightRadius: 28,
-    paddingHorizontal: 20,
-    paddingTop: 12,
-    maxHeight: '92%',
+    borderTopLeftRadius: 24,
+    borderTopRightRadius: 24,
+    paddingHorizontal: 16,
+    paddingTop: 10,
+    maxHeight: '90%',
     borderTopWidth: 1,
     borderColor: COLORS.cardBorder,
   },
+  scrollContent: {
+    paddingBottom: Platform.OS === 'ios' ? 20 : 10,
+  },
   handle: {
-    width: 40,
+    width: 36,
     height: 4,
     backgroundColor: COLORS.cardBorder,
     borderRadius: 2,
     alignSelf: 'center',
-    marginBottom: 20,
+    marginBottom: 16,
   },
 
-  // Header
   header: {
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'flex-start',
-    marginBottom: 20,
+    marginBottom: 16,
   },
   headerTitle: {
-    fontSize: 22,
+    fontSize: 20,
     fontWeight: '700',
     color: COLORS.text,
-    letterSpacing: 0.2,
   },
   headerSub: {
-    fontSize: 13,
+    fontSize: 11,
     color: COLORS.textMuted,
     marginTop: 2,
   },
   closeBtn: {
-    width: 34,
-    height: 34,
-    borderRadius: 17,
+    width: 30,
+    height: 30,
+    borderRadius: 15,
     backgroundColor: COLORS.card,
     borderWidth: 1,
     borderColor: COLORS.cardBorder,
@@ -310,81 +477,97 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
 
-  // Budget Banner
   budgetBanner: {
     flexDirection: 'row',
-    justifyContent: 'space-between',
     alignItems: 'center',
     backgroundColor: COLORS.card,
-    borderRadius: 14,
-    padding: 16,
-    marginBottom: 24,
+    borderRadius: 12,
+    padding: 12,
+    marginBottom: 16,
     borderWidth: 1,
     borderColor: COLORS.cardBorder,
   },
+  budgetLeft: {
+    flex: 1,
+  },
   bannerLabel: {
     fontSize: 9,
-    letterSpacing: 1.8,
+    letterSpacing: 1.2,
     color: COLORS.textMuted,
-    marginBottom: 4,
+    marginBottom: 2,
   },
   bannerAmount: {
-    fontSize: 22,
+    fontSize: 20,
     fontWeight: '800',
     letterSpacing: -0.5,
-    fontVariant: ['tabular-nums'],
   },
-  bannerRight: {
+  budgetDivider: {
+    width: 1,
+    height: 30,
+    backgroundColor: COLORS.cardBorder,
+    marginHorizontal: 12,
+  },
+  budgetRight: {
     alignItems: 'flex-end',
-    gap: 4,
   },
   bannerMeta: {
-    fontSize: 11,
+    fontSize: 10,
     color: COLORS.textDim,
-    letterSpacing: 0.3,
-  },
-  bannerMetaVal: {
-    color: COLORS.textMuted,
-    fontWeight: '600',
   },
 
-  // Section
   section: {
-    marginBottom: 22,
+    marginBottom: 16,
+  },
+  amountSection: {
+    marginBottom: 8,
   },
   label: {
     fontSize: 9,
-    letterSpacing: 1.8,
+    letterSpacing: 1.2,
     color: COLORS.textMuted,
-    marginBottom: 10,
+    marginBottom: 6,
   },
   optional: {
     color: COLORS.textDim,
-    letterSpacing: 1,
   },
 
-  // Amount
+  tagScrollContent: {
+    paddingRight: 8,
+  },
+  tagChip: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 5,
+    paddingHorizontal: 12,
+    paddingVertical: 7,
+    borderRadius: 16,
+    borderWidth: 1,
+  },
+  tagLabel: {
+    fontSize: 12,
+    fontWeight: '500',
+  },
+
   amountRow: {
     flexDirection: 'row',
     alignItems: 'center',
     backgroundColor: COLORS.card,
-    borderRadius: 14,
+    borderRadius: 12,
     borderWidth: 1,
     borderColor: COLORS.cardBorder,
-    paddingHorizontal: 16,
+    paddingHorizontal: 12,
   },
   rupee: {
-    fontSize: 26,
+    fontSize: 22,
     fontWeight: '700',
     marginRight: 4,
   },
   amountInput: {
     flex: 1,
-    fontSize: 32,
+    fontSize: 28,
     fontWeight: '700',
-    paddingVertical: 14,
+    paddingVertical: 10,
     letterSpacing: -0.5,
-    fontVariant: ['tabular-nums'],
   },
   clearBtn: {
     padding: 4,
@@ -401,65 +584,61 @@ const styles = StyleSheet.create({
     borderRadius: 2,
   },
   overText: {
-    fontSize: 11,
+    fontSize: 10,
     color: COLORS.crimson,
-    marginTop: 6,
-    letterSpacing: 0.2,
+    marginTop: 4,
   },
 
-  // Text inputs
   textInput: {
     backgroundColor: COLORS.card,
-    borderRadius: 14,
+    borderRadius: 12,
     borderWidth: 1,
     borderColor: COLORS.cardBorder,
-    paddingHorizontal: 16,
-    paddingVertical: 14,
-    fontSize: 15,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    fontSize: 14,
     color: COLORS.text,
   },
   noteInput: {
-    minHeight: 80,
+    minHeight: 60,
+    textAlignVertical: 'top',
   },
 
-  // Tags
-  tagRow: {
-    flexDirection: 'row',
-    gap: 10,
-  },
-  tagChip: {
+  budgetWarningChip: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: 6,
-    paddingHorizontal: 14,
-    paddingVertical: 9,
-    borderRadius: 20,
-    borderWidth: 1,
+    backgroundColor: COLORS.crimsonDim,
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    marginBottom: 16,
   },
-  tagLabel: {
-    fontSize: 13,
+  budgetWarningText: {
+    fontSize: 11,
+    color: COLORS.crimson,
     fontWeight: '500',
   },
 
-  // Submit - Always green
   submitBtn: {
-    borderRadius: 14,
+    borderRadius: 12,
     overflow: 'hidden',
     marginTop: 8,
-    marginBottom: 10,
+  },
+  submitBtnDisabled: {
+    opacity: 0.6,
   },
   submitGrad: {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
-    gap: 8,
-    paddingVertical: 16,
+    gap: 6,
+    paddingVertical: 12,
   },
   submitText: {
-    fontSize: 16,
+    fontSize: 14,
     fontWeight: '700',
     color: COLORS.bg,
-    letterSpacing: 0.3,
   },
 });
 

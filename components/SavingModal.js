@@ -201,7 +201,7 @@ const SavingsModal = ({
       setError('');
       setTab('history');
       
-      Alert.alert('Success', `₹${saveAmount.toFixed(2)} moved to savings!`);
+      
     } catch (err) {
       console.error('Error saving:', err);
       setError('Something went wrong. Please try again.');
